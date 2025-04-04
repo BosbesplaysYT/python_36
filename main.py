@@ -2,23 +2,16 @@ import sys
 import os
 import ctypes
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QTextEdit, QAction, QFileDialog,
+    QApplication, QMainWindow, QPlainTextEdit, QAction, QFileDialog,
     QMessageBox, QShortcut, QTreeView, QWidget, QHBoxLayout, QVBoxLayout,
-    QPushButton, QSplitter, QStackedWidget, QTabWidget, QLabel, QToolButton
+    QPushButton, QSplitter, QStackedWidget, QTabWidget, QLabel, QToolButton,
+    QScrollArea, QListWidget, QListWidgetItem, QToolTip
 )
-from PyQt5.QtCore import QFile, QTextStream, Qt, QPoint, QSettings
-from PyQt5.QtGui import QKeySequence, QIcon
-from PyQt5.QtWidgets import QFileSystemModel
-from PyQt5.QtGui import QSyntaxHighlighter, QTextCharFormat, QColor, QFont
-from PyQt5.QtCore import QRegularExpression
-from PyQt5.QtWidgets import QToolButton, QTabBar
-from PyQt5.QtGui import QPixmap
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QScrollArea
+from PyQt5.QtCore import QFile, QSettings, Qt, QPoint, QTimer, QRegularExpression, QThread, pyqtSignal, QObject
+from PyQt5.QtGui import QKeySequence, QIcon, QPixmap, QSyntaxHighlighter, QTextCharFormat, QColor, QFont
 
 # --- Low Level Windows API call for dark title bar ---
 def set_dark_mode(win_id):
-    # Only works on Windows 10/11
     try:
         DWMWA_USE_IMMERSIVE_DARK_MODE = 20
         value = ctypes.c_int(1)
@@ -26,51 +19,144 @@ def set_dark_mode(win_id):
     except Exception as e:
         print("Could not set dark mode:", e)
 
+# --- Syntax Checker Worker (runs in a separate thread) ---
+class SyntaxChecker(QObject):
+    # Emit a list of error dictionaries: each error has line, col, message.
+    syntaxChecked = pyqtSignal(list)
+    
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+        
+    def run(self):
+        errors = []
+        try:
+            compile(self.text, "<document>", "exec")
+        except SyntaxError as e:
+            if e.lineno is not None:
+                error = {
+                    'line': e.lineno - 1,  # 0-based block number.
+                    'col': (e.offset - 1) if e.offset is not None else 0,
+                    'message': str(e)
+                }
+                errors.append(error)
+        self.syntaxChecked.emit(errors)
+
+# --- Custom Editor Widget with Tooltip Support ---
+class CodeEditorWidget(QPlainTextEdit):
+    def __init__(self, *args, **kwargs):
+        super(CodeEditorWidget, self).__init__(*args, **kwargs)
+        # Use a fixed-width font.
+        self.setFont(QFont("Consolas", 11))
+        # Install an event filter on the viewport for hover events.
+        self.viewport().installEventFilter(self)
+    
+    def eventFilter(self, obj, event):
+        if obj == self.viewport() and event.type() == event.MouseMove:
+            # Get cursor position in document.
+            cursor = self.cursorForPosition(event.pos())
+            block = cursor.block()
+            blockNum = block.blockNumber()
+            # If our highlighter (attached as self.highlighter) has error details, check them.
+            if hasattr(self, 'highlighter') and hasattr(self.highlighter, 'error_details'):
+                if blockNum in self.highlighter.error_details:
+                    error_msg = self.highlighter.error_details[blockNum]
+                    QToolTip.showText(event.globalPos(), error_msg)
+                else:
+                    QToolTip.hideText()
+        return super(CodeEditorWidget, self).eventFilter(obj, event)
+
+# --- Improved Python Highlighter with Offloaded Syntax Checking and Error Reporting ---
 class PythonHighlighter(QSyntaxHighlighter):
+    # Signal to update the error panel; emits a list of error dicts.
+    errorsUpdated = pyqtSignal(list)
+    
     def __init__(self, document):
         super(PythonHighlighter, self).__init__(document)
         self.highlightingRules = []
+        self._syntaxTimer = QTimer()
+        self._syntaxTimer.setSingleShot(True)
+        self._syntaxTimer.timeout.connect(self.checkSyntax)
+        # Store errors both as positions and as full error details.
+        self.error_positions = {}  # Map block number -> (col, length)
+        self.error_details = {}    # Map block number -> error message
 
-        # Keyword formatting
+        # --- Keyword Formatting ---
         keywordFormat = QTextCharFormat()
         keywordFormat.setForeground(QColor("#569CD6"))
         keywordFormat.setFontWeight(QFont.Bold)
         keywords = [
-            "def", "class", "if", "else", "elif", "while", "for", "return", 
-            "import", "from", "as", "pass", "break", "continue", "try", "except", 
-            "finally", "with", "lambda", "None", "True", "False"
+            "def", "class", "if", "else", "elif", "while", "for", "return",
+            "import", "from", "as", "pass", "break", "continue", "try", "except",
+            "finally", "with", "lambda", "None", "True", "False", "in", "not", "and", "or"
         ]
         for word in keywords:
             pattern = QRegularExpression(r'\b' + word + r'\b')
             self.highlightingRules.append((pattern, keywordFormat))
 
-        # Comment formatting
+        # --- Comment Formatting ---
         commentFormat = QTextCharFormat()
         commentFormat.setForeground(QColor("#6A9955"))
         commentPattern = QRegularExpression(r'#.*')
         self.highlightingRules.append((commentPattern, commentFormat))
 
-        # String literal formatting
+        # --- String Literal Formatting ---
         stringFormat = QTextCharFormat()
         stringFormat.setForeground(QColor("#D69D85"))
-        # This regex covers both single and double quotes (basic handling).
-        stringPattern = QRegularExpression(r'(\".*\"|\'.*\')')
+        stringPattern = QRegularExpression(r'(\".*?\"|\'.*?\')')
         self.highlightingRules.append((stringPattern, stringFormat))
 
-        # Number formatting
+        # --- Number Formatting ---
         numberFormat = QTextCharFormat()
         numberFormat.setForeground(QColor("#B5CEA8"))
         numberPattern = QRegularExpression(r'\b[0-9]+(\.[0-9]+)?\b')
         self.highlightingRules.append((numberPattern, numberFormat))
 
-        # Function definition (simple heuristic)
+        # --- Function Definition Formatting (heuristic) ---
         funcFormat = QTextCharFormat()
         funcFormat.setForeground(QColor("#DCDCAA"))
         funcPattern = QRegularExpression(r'\bdef\s+([A-Za-z_][A-Za-z0-9_]*)')
         self.highlightingRules.append((funcPattern, funcFormat))
 
+        # --- Triple-quoted String Formatting ---
+        self.tripleQuoteFormat = QTextCharFormat()
+        self.tripleQuoteFormat.setForeground(QColor("#D69D85"))
+
+        # --- Syntax Error Formatting ---
+        self.errorFormat = QTextCharFormat()
+        self.errorFormat.setUnderlineColor(QColor("red"))
+        self.errorFormat.setUnderlineStyle(QTextCharFormat.SpellCheckUnderline)
+
+        # Trigger syntax check when document changes.
+        document.contentsChanged.connect(self.triggerSyntaxCheck)
+
+    def triggerSyntaxCheck(self):
+        self._syntaxTimer.start(300)
+
+    def checkSyntax(self):
+        text = self.document().toPlainText()
+        self.syntaxThread = QThread()
+        self.syntaxWorker = SyntaxChecker(text)
+        self.syntaxWorker.moveToThread(self.syntaxThread)
+        self.syntaxThread.started.connect(self.syntaxWorker.run)
+        self.syntaxWorker.syntaxChecked.connect(self.onSyntaxChecked)
+        self.syntaxWorker.syntaxChecked.connect(self.syntaxThread.quit)
+        self.syntaxWorker.syntaxChecked.connect(self.syntaxWorker.deleteLater)
+        self.syntaxThread.finished.connect(self.syntaxThread.deleteLater)
+        self.syntaxThread.start()
+
+    def onSyntaxChecked(self, errors):
+        # Reset error dictionaries.
+        self.error_positions = {}
+        self.error_details = {}
+        for error in errors:
+            self.error_positions[error['line']] = (error['col'], 1)
+            self.error_details[error['line']] = error['message']
+        self.errorsUpdated.emit(errors)
+        self.rehighlight()
 
     def highlightBlock(self, text):
+        # Apply syntax rules.
         for pattern, fmt in self.highlightingRules:
             iterator = pattern.globalMatch(text)
             while iterator.hasNext():
@@ -78,7 +164,33 @@ class PythonHighlighter(QSyntaxHighlighter):
                 start = match.capturedStart()
                 length = match.capturedLength()
                 self.setFormat(start, length, fmt)
+        # Handle triple-quoted strings.
+        for delimiter in ['"""', "'''"]:
+            self.highlightMultiline(text, delimiter)
+        # Underline errors.
+        block_num = self.currentBlock().blockNumber()
+        if block_num in self.error_positions:
+            col, length = self.error_positions[block_num]
+            if col < len(text):
+                self.setFormat(col, length, self.errorFormat)
 
+    def highlightMultiline(self, text, delimiter):
+        startIndex = 0
+        if self.previousBlockState() != 1:
+            startIndex = text.find(delimiter)
+        else:
+            startIndex = 0
+        while startIndex >= 0:
+            endIndex = text.find(delimiter, startIndex + len(delimiter))
+            if endIndex == -1:
+                self.setCurrentBlockState(1)
+                stringLength = len(text) - startIndex
+            else:
+                stringLength = endIndex - startIndex + len(delimiter)
+            self.setFormat(startIndex, stringLength, self.tripleQuoteFormat)
+            startIndex = text.find(delimiter, startIndex + stringLength)
+        if self.currentBlockState() != 1:
+            self.setCurrentBlockState(0)
 
 # --- Custom Title Bar ---
 class CustomTitleBar(QWidget):
@@ -97,27 +209,19 @@ class CustomTitleBar(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(5, 0, 5, 0)
         layout.setSpacing(10)
-        
         layout.addStretch()
-        
-        # Right: System buttons (minimize, maximize, close)
         self.btnMin = QToolButton(self)
         self.btnMin.setText("—")
         self.btnMin.setStyleSheet("background-color: #3c3c3c; color: #ffffff; border: none; padding: 5px;")
         self.btnMin.clicked.connect(self.parent.showMinimized)
         layout.addWidget(self.btnMin)
-        
         self.btnMax = QToolButton(self)
         self.btnMax.setText("▢")
         self.btnMax.setStyleSheet("background-color: #3c3c3c; color: #ffffff; border: none; padding: 5px;")
         self.btnMax.clicked.connect(self.toggleMaxRestore)
         layout.addWidget(self.btnMax)
-        
-        # Replace the close button creation in CustomTitleBar.initUI:
         self.btnClose = QToolButton(self)
-        # Use a simple white cross. You can experiment with Unicode characters.
         self.btnClose.setText("✖")
-        # Update the style sheet to remove background or use a flat look.
         self.btnClose.setStyleSheet("""
             QToolButton {
                 background-color: transparent;
@@ -132,7 +236,6 @@ class CustomTitleBar(QWidget):
         self.btnClose.clicked.connect(self.parent.close)
         layout.addWidget(self.btnClose)
 
-
     def toggleMaxRestore(self):
         if self.parent.isMaximized():
             self.parent.showNormal()
@@ -141,7 +244,6 @@ class CustomTitleBar(QWidget):
             self.parent.showMaximized()
             self.btnMax.setText("❐")
 
-    # Allow dragging of the window by the title bar.
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.startPos = event.globalPos()
@@ -163,21 +265,18 @@ class CustomTitleBar(QWidget):
 class CodeEditor(QMainWindow):
     def __init__(self):
         super().__init__()
-        # Remove native title bar to use our custom one
         self.setWindowFlags(Qt.FramelessWindowHint)
-        self.openFiles = {}  # Map file paths to their corresponding editor widgets
+        self.openFiles = {}  # Map file paths to their editor widgets.
         self.settings = QSettings("MyCompany", "PyQtCodeEditor")
         self.initUI()
         self.restoreAppState()
 
     def initUI(self):
-        # Create custom title bar and add it to the window layout.
         self.titleBar = CustomTitleBar(self)
-        
-        # Create the tab widget to hold multiple editors.
         self.tabWidget = QTabWidget()
         self.tabWidget.setTabsClosable(True)
         self.tabWidget.tabCloseRequested.connect(self.closeTab)
+        self.tabWidget.currentChanged.connect(self.onTabChanged)
         self.tabWidget.setStyleSheet("""
             QTabBar::tab {
                 background: #3c3c3c;
@@ -188,137 +287,96 @@ class CodeEditor(QMainWindow):
                 background: #313335;
             }
         """)
-        
-        # Create the sidebar widget (holds the icon bar and dynamic content)
         self.sideBar = self.createSideBar()
-        
-        # Create a splitter to hold the sidebar and the tab widget
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.addWidget(self.sideBar)
         self.splitter.addWidget(self.tabWidget)
-        self.splitter.setStretchFactor(1, 1)  # Make tabs take up remaining space
-
-        # Central widget will be a vertical layout: custom title bar on top, then the splitter.
+        self.splitter.setStretchFactor(1, 1)
+        # Bottom error panel.
+        self.errorList = QListWidget()
+        self.errorList.setStyleSheet("background-color: #3c3c3c; color: #ffffff;")
+        self.errorList.itemClicked.connect(self.onErrorItemClicked)
+        # Layout: title bar, splitter, then error list.
         centralWidget = QWidget()
         centralLayout = QVBoxLayout(centralWidget)
         centralLayout.setContentsMargins(0, 0, 0, 0)
         centralLayout.setSpacing(0)
         centralLayout.addWidget(self.titleBar)
         centralLayout.addWidget(self.splitter)
+        centralLayout.addWidget(self.errorList)
         self.setCentralWidget(centralWidget)
-        
-        # Set up the menu bar with file and directory operations.
-        # (We add these actions to our QMainWindow even though we have a custom title bar.)
         self.createMenuBar()
-        
-        # Set window geometry and apply dark theme.
         self.setGeometry(100, 100, 1200, 700)
         self.applyDarkTheme()
-        
-        # Add keyboard shortcut for saving (Ctrl+S).
         self.shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
         self.shortcut_save.activated.connect(self.handleSave)
-        
-        # Set dark mode for the window decorations using low-level API (Windows only).
         set_dark_mode(self.winId())
 
     def createMenuBar(self):
         menubar = self.menuBar()
-        # Even though our native title bar is replaced, QMenuBar still appears below it.
         fileMenu = menubar.addMenu('File')
-
         openAction = QAction('Open File', self)
         openAction.triggered.connect(self.openFile)
         fileMenu.addAction(openAction)
-
         saveAction = QAction('Save', self)
         saveAction.triggered.connect(self.handleSave)
         fileMenu.addAction(saveAction)
-        
         openDirAction = QAction('Open Directory', self)
         openDirAction.triggered.connect(self.openDirectory)
         fileMenu.addAction(openDirAction)
-
         exitAction = QAction('Exit', self)
         exitAction.triggered.connect(self.close)
         fileMenu.addAction(exitAction)
 
     def createSideBar(self):
-        """
-        Creates a widget that holds two sidebars:
-        - A narrow icon bar on the left.
-        - A dynamic content area on the right (currently set to display a filesystem tree view with a header label).
-        """
         sidebarWidget = QWidget()
         layout = QHBoxLayout(sidebarWidget)
         layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Left Icon Bar (narrow)
         iconBar = QWidget()
         iconBarLayout = QVBoxLayout(iconBar)
         iconBarLayout.setContentsMargins(0, 0, 0, 0)
         iconBar.setFixedWidth(40)
-        
-        # For now, add a single button representing the file system.
         fsButton = QPushButton("FS")
         fsButton.setFixedWidth(40)
         fsButton.setStyleSheet("background-color: #3c3c3c; color: #ffffff;")
         iconBarLayout.addWidget(fsButton)
         iconBarLayout.addStretch()
-
-        # Right Sidebar Content Area using a vertical layout.
         contentWidget = QWidget()
         contentLayout = QVBoxLayout(contentWidget)
         contentLayout.setContentsMargins(5, 5, 5, 5)
-        
-        # Label to show current directory.
         self.dirLabel = QLabel("No directory opened")
         self.dirLabel.setStyleSheet("color: #ffffff; font-size: 10pt;")
         contentLayout.addWidget(self.dirLabel)
-        
-        # File system tree view.
         self.fsTreeView = QTreeView()
+        from PyQt5.QtWidgets import QFileSystemModel
         self.fsModel = QFileSystemModel()
-        self.fsModel.setRootPath("")  # Start with an empty root.
+        self.fsModel.setRootPath("")
         self.fsTreeView.setModel(self.fsModel)
-        # Hide unnecessary columns; show only file/folder names.
         for i in range(1, self.fsModel.columnCount()):
             self.fsTreeView.hideColumn(i)
-        # Connect double-click signal to open files.
         self.fsTreeView.doubleClicked.connect(self.onTreeDoubleClicked)
-        # Style for dark theme.
         self.fsTreeView.setStyleSheet("background-color: #313335; color: #ffffff;")
         contentLayout.addWidget(self.fsTreeView)
-        
-        # Use QStackedWidget if you plan to add more dynamic sidebar content.
         self.sidebarStack = QStackedWidget()
         self.sidebarStack.addWidget(contentWidget)
-        
         layout.addWidget(iconBar)
         layout.addWidget(self.sidebarStack)
-        sidebarWidget.setFixedWidth(300)  # Overall sidebar width.
+        sidebarWidget.setFixedWidth(300)
         return sidebarWidget
 
     def onTreeDoubleClicked(self, index):
-        # Get full path of the clicked item.
         file_path = self.fsModel.filePath(index)
-        # If it's a file, open it in a new tab.
         if os.path.isfile(file_path):
             self.openFileInTab(file_path)
 
-
     def openFileInTab(self, file_path):
-        # If the file is already open, switch to its tab.
         if file_path in self.openFiles:
             index = self.tabWidget.indexOf(self.openFiles[file_path])
             self.tabWidget.setCurrentIndex(index)
             return
-
         filename = os.path.basename(file_path)
         ext = os.path.splitext(file_path)[1].lower()
         image_exts = ['.png', '.jpg', '.jpeg', '.bmp', '.gif']
-
-        # --- Handle image files ---
         if ext in image_exts:
             label = QLabel()
             pixmap = QPixmap(file_path)
@@ -327,18 +385,13 @@ class CodeEditor(QMainWindow):
                 return
             label.setPixmap(pixmap)
             label.setAlignment(Qt.AlignCenter)
-
-            # Optional: Use a scroll area if the image is large
             scrollArea = QScrollArea()
             scrollArea.setWidget(label)
             scrollArea.setWidgetResizable(True)
-
             self.tabWidget.addTab(scrollArea, filename)
             self.tabWidget.setCurrentWidget(scrollArea)
             self.openFiles[file_path] = scrollArea
             return
-
-        # --- Attempt to open file as text ---
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 text = f.read()
@@ -348,8 +401,6 @@ class CodeEditor(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not open file: {file_path}\n{e}")
             return
-
-        # --- If file isn't text-based (and isn't an image) ---
         if not is_text:
             reply = QMessageBox.question(
                 self, 
@@ -361,7 +412,6 @@ class CodeEditor(QMainWindow):
             if reply == QMessageBox.No:
                 return
             else:
-                # Open the file in binary mode and decode with errors replaced.
                 try:
                     with open(file_path, 'rb') as f:
                         raw = f.read()
@@ -369,26 +419,18 @@ class CodeEditor(QMainWindow):
                 except Exception as e:
                     QMessageBox.warning(self, "Error", f"Could not open file: {file_path}\n{e}")
                     return
-
-        # --- Create a text editor for text-based files ---
-        editor = QTextEdit()
+        editor = CodeEditorWidget()
         editor.setPlainText(text)
         editor.setStyleSheet("background-color: #313335; color: #ffffff;")
-        
-        # Add syntax highlighting for Python files.
         if file_path.endswith(".py"):
             editor.highlighter = PythonHighlighter(editor.document())
-
-        # Save the original text for unsaved changes tracking.
+            # Connect highlighter signal to update error list.
+            editor.highlighter.errorsUpdated.connect(self.updateErrorList)
         editor.originalText = text
         editor.textChanged.connect(lambda: self.updateTabTitle(editor, file_path))
-
         index = self.tabWidget.addTab(editor, filename)
         self.tabWidget.setCurrentWidget(editor)
         self.openFiles[file_path] = editor
-
-
-
 
     def openFile(self):
         options = QFileDialog.Options()
@@ -406,9 +448,7 @@ class CodeEditor(QMainWindow):
         index = self.tabWidget.indexOf(editor)
         filename = os.path.basename(file_path)
         currentText = editor.toPlainText()
-        # If the text differs from the original, mark as unsaved.
         if currentText != editor.originalText:
-            # Add a white dot (●) to indicate unsaved changes.
             title = f"{filename} ●"
         else:
             title = filename
@@ -425,7 +465,6 @@ class CodeEditor(QMainWindow):
                 break
         if file_path:
             self.saveToFile(file_path, currentEditor)
-            # After saving, update the original text and remove the unsaved marker.
             currentEditor.originalText = currentEditor.toPlainText()
             self.updateTabTitle(currentEditor, file_path)
         else:
@@ -450,38 +489,61 @@ class CodeEditor(QMainWindow):
             options=options
         )
         if file_path:
-            # Update mapping.
             self.openFiles[file_path] = editor
-            # Change the tab title.
             current_index = self.tabWidget.currentIndex()
             self.tabWidget.setTabText(current_index, os.path.basename(file_path))
             self.saveToFile(file_path, editor)
 
     def closeTab(self, index):
         widget = self.tabWidget.widget(index)
-        # Remove widget from the mapping.
         for path, editor in list(self.openFiles.items()):
             if editor == widget:
                 del self.openFiles[path]
                 break
         self.tabWidget.removeTab(index)
+        # Clear error list if no tabs remain.
+        if self.tabWidget.count() == 0:
+            self.errorList.clear()
 
     def openDirectory(self):
-        """
-        Opens a directory dialog, updates the file system tree view,
-        and sets the label to the selected directory.
-        """
         options = QFileDialog.Options()
         directory = QFileDialog.getExistingDirectory(self, "Open Directory", "", options=options)
         if directory:
-            # Update the label.
             self.dirLabel.setText(f"Folder: {directory}")
-            # Set the file system model's root.
             index = self.fsModel.setRootPath(directory)
             self.fsTreeView.setRootIndex(index)
 
+    def updateErrorList(self, errors):
+        self.errorList.clear()
+        for error in errors:
+            # Display line number (1-based) and a snippet of the error message.
+            item_text = f"Line {error['line']+1}: {error['message']}"
+            item = QListWidgetItem(item_text)
+            # Store the line number in the item for navigation.
+            item.setData(Qt.UserRole, error['line'])
+            self.errorList.addItem(item)
+
+    def onErrorItemClicked(self, item):
+        line = item.data(Qt.UserRole)
+        currentEditor = self.tabWidget.currentWidget()
+        if currentEditor:
+            # Move cursor to the beginning of the error line.
+            cursor = currentEditor.textCursor()
+            block = currentEditor.document().findBlockByNumber(line)
+            cursor.setPosition(block.position())
+            currentEditor.setTextCursor(cursor)
+            currentEditor.setFocus()
+
+    def onTabChanged(self, index):
+        # Clear error list when switching tabs if highlighter isn't available.
+        currentEditor = self.tabWidget.widget(index)
+        if currentEditor and hasattr(currentEditor, 'highlighter'):
+            # Trigger a syntax check to update error list.
+            currentEditor.highlighter.triggerSyntaxCheck()
+        else:
+            self.errorList.clear()
+
     def applyDarkTheme(self):
-        # Overall dark stylesheet.
         darkStyleSheet = """
         QWidget {
             background-color: #2b2b2b;
@@ -504,46 +566,36 @@ class CodeEditor(QMainWindow):
         QMenu::item:selected {
             background-color: #3c3c3c;
         }
-        QTabWidget::pane { /* The tab widget frame */
+        QTabWidget::pane {
             border-top: 2px solid #313335;
         }
         """
         self.setStyleSheet(darkStyleSheet)
 
     def closeEvent(self, event):
-        """Save state when closing."""
         self.saveAppState()
         event.accept()
 
     def saveAppState(self):
-        # Save window geometry and state.
         self.settings.setValue("geometry", self.saveGeometry())
-        # Save open files (only file paths; unsaved changes are not handled here).
         self.settings.setValue("openFiles", list(self.openFiles.keys()))
-        # Save active tab index.
         self.settings.setValue("activeTab", self.tabWidget.currentIndex())
-        # Save open directory (from the label).
         self.settings.setValue("openDirectory", self.dirLabel.text())
         
     def restoreAppState(self):
         geometry = self.settings.value("geometry")
         if geometry:
             self.restoreGeometry(geometry)
-        # Restore open files.
         files = self.settings.value("openFiles")
         if files:
-            # If multiple files were open, open them in tabs.
             for file_path in files:
                 if os.path.exists(file_path):
                     self.openFileInTab(file_path)
-        # Restore active tab index.
         activeTab = self.settings.value("activeTab")
         if activeTab is not None and self.tabWidget.count() > int(activeTab):
             self.tabWidget.setCurrentIndex(int(activeTab))
-        # Restore open directory label.
         openDir = self.settings.value("openDirectory")
         if openDir and openDir.startswith("Folder:"):
-            # Extract the path from the label text.
             directory = openDir.split("Folder:")[1].strip()
             if os.path.isdir(directory):
                 self.dirLabel.setText(openDir)
