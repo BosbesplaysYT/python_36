@@ -9,6 +9,12 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QFile, QTextStream, Qt, QPoint, QSettings
 from PyQt5.QtGui import QKeySequence, QIcon
 from PyQt5.QtWidgets import QFileSystemModel
+from PyQt5.QtGui import QSyntaxHighlighter, QTextCharFormat, QColor, QFont
+from PyQt5.QtCore import QRegularExpression
+from PyQt5.QtWidgets import QToolButton, QTabBar
+from PyQt5.QtGui import QPixmap
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QScrollArea
 
 # --- Low Level Windows API call for dark title bar ---
 def set_dark_mode(win_id):
@@ -19,6 +25,60 @@ def set_dark_mode(win_id):
         ctypes.windll.dwmapi.DwmSetWindowAttribute(int(win_id), DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(value), ctypes.sizeof(value))
     except Exception as e:
         print("Could not set dark mode:", e)
+
+class PythonHighlighter(QSyntaxHighlighter):
+    def __init__(self, document):
+        super(PythonHighlighter, self).__init__(document)
+        self.highlightingRules = []
+
+        # Keyword formatting
+        keywordFormat = QTextCharFormat()
+        keywordFormat.setForeground(QColor("#569CD6"))
+        keywordFormat.setFontWeight(QFont.Bold)
+        keywords = [
+            "def", "class", "if", "else", "elif", "while", "for", "return", 
+            "import", "from", "as", "pass", "break", "continue", "try", "except", 
+            "finally", "with", "lambda", "None", "True", "False"
+        ]
+        for word in keywords:
+            pattern = QRegularExpression(r'\b' + word + r'\b')
+            self.highlightingRules.append((pattern, keywordFormat))
+
+        # Comment formatting
+        commentFormat = QTextCharFormat()
+        commentFormat.setForeground(QColor("#6A9955"))
+        commentPattern = QRegularExpression(r'#.*')
+        self.highlightingRules.append((commentPattern, commentFormat))
+
+        # String literal formatting
+        stringFormat = QTextCharFormat()
+        stringFormat.setForeground(QColor("#D69D85"))
+        # This regex covers both single and double quotes (basic handling).
+        stringPattern = QRegularExpression(r'(\".*\"|\'.*\')')
+        self.highlightingRules.append((stringPattern, stringFormat))
+
+        # Number formatting
+        numberFormat = QTextCharFormat()
+        numberFormat.setForeground(QColor("#B5CEA8"))
+        numberPattern = QRegularExpression(r'\b[0-9]+(\.[0-9]+)?\b')
+        self.highlightingRules.append((numberPattern, numberFormat))
+
+        # Function definition (simple heuristic)
+        funcFormat = QTextCharFormat()
+        funcFormat.setForeground(QColor("#DCDCAA"))
+        funcPattern = QRegularExpression(r'\bdef\s+([A-Za-z_][A-Za-z0-9_]*)')
+        self.highlightingRules.append((funcPattern, funcFormat))
+
+
+    def highlightBlock(self, text):
+        for pattern, fmt in self.highlightingRules:
+            iterator = pattern.globalMatch(text)
+            while iterator.hasNext():
+                match = iterator.next()
+                start = match.capturedStart()
+                length = match.capturedLength()
+                self.setFormat(start, length, fmt)
+
 
 # --- Custom Title Bar ---
 class CustomTitleBar(QWidget):
@@ -38,17 +98,6 @@ class CustomTitleBar(QWidget):
         layout.setContentsMargins(5, 0, 5, 0)
         layout.setSpacing(10)
         
-        # Left: Window title label
-        self.titleLabel = QLabel("PyQt Code Editor")
-        self.titleLabel.setStyleSheet("color: #ffffff; font-size: 12pt;")
-        layout.addWidget(self.titleLabel)
-        
-        # Middle: Custom menu bar buttons (for demonstration)
-        self.fileBtn = QPushButton("File")
-        self.fileBtn.setStyleSheet("background-color: #3c3c3c; color: #ffffff; border: none; padding: 5px;")
-        # Future: Connect this button to show a custom file menu.
-        layout.addWidget(self.fileBtn)
-        
         layout.addStretch()
         
         # Right: System buttons (minimize, maximize, close)
@@ -64,11 +113,25 @@ class CustomTitleBar(QWidget):
         self.btnMax.clicked.connect(self.toggleMaxRestore)
         layout.addWidget(self.btnMax)
         
+        # Replace the close button creation in CustomTitleBar.initUI:
         self.btnClose = QToolButton(self)
-        self.btnClose.setText("✕")
-        self.btnClose.setStyleSheet("background-color: #E81123; color: #ffffff; border: none; padding: 5px;")
+        # Use a simple white cross. You can experiment with Unicode characters.
+        self.btnClose.setText("✖")
+        # Update the style sheet to remove background or use a flat look.
+        self.btnClose.setStyleSheet("""
+            QToolButton {
+                background-color: transparent;
+                color: #ffffff;
+                border: none;
+                font-size: 14pt;
+            }
+            QToolButton:hover {
+                color: #ff5555;
+            }
+        """)
         self.btnClose.clicked.connect(self.parent.close)
         layout.addWidget(self.btnClose)
+
 
     def toggleMaxRestore(self):
         if self.parent.isMaximized():
@@ -243,36 +306,89 @@ class CodeEditor(QMainWindow):
         if os.path.isfile(file_path):
             self.openFileInTab(file_path)
 
+
     def openFileInTab(self, file_path):
         # If the file is already open, switch to its tab.
         if file_path in self.openFiles:
             index = self.tabWidget.indexOf(self.openFiles[file_path])
             self.tabWidget.setCurrentIndex(index)
             return
-        
-        # Try opening the file.
-        file = QFile(file_path)
-        if file.open(QFile.ReadOnly | QFile.Text):
-            textStream = QTextStream(file)
-            text = textStream.readAll()
-            file.close()
-        else:
-            QMessageBox.warning(self, "Error", f"Could not open file: {file_path}")
+
+        filename = os.path.basename(file_path)
+        ext = os.path.splitext(file_path)[1].lower()
+        image_exts = ['.png', '.jpg', '.jpeg', '.bmp', '.gif']
+
+        # --- Handle image files ---
+        if ext in image_exts:
+            label = QLabel()
+            pixmap = QPixmap(file_path)
+            if pixmap.isNull():
+                QMessageBox.warning(self, "Error", f"Could not open image: {file_path}")
+                return
+            label.setPixmap(pixmap)
+            label.setAlignment(Qt.AlignCenter)
+
+            # Optional: Use a scroll area if the image is large
+            scrollArea = QScrollArea()
+            scrollArea.setWidget(label)
+            scrollArea.setWidgetResizable(True)
+
+            self.tabWidget.addTab(scrollArea, filename)
+            self.tabWidget.setCurrentWidget(scrollArea)
+            self.openFiles[file_path] = scrollArea
             return
 
-        # Create a new text editor for the file.
+        # --- Attempt to open file as text ---
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            is_text = True
+        except UnicodeDecodeError:
+            is_text = False
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not open file: {file_path}\n{e}")
+            return
+
+        # --- If file isn't text-based (and isn't an image) ---
+        if not is_text:
+            reply = QMessageBox.question(
+                self, 
+                "Binary file",
+                f"The file {filename} does not appear to be text-based. Open it anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+            else:
+                # Open the file in binary mode and decode with errors replaced.
+                try:
+                    with open(file_path, 'rb') as f:
+                        raw = f.read()
+                    text = raw.decode('utf-8', errors='replace')
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Could not open file: {file_path}\n{e}")
+                    return
+
+        # --- Create a text editor for text-based files ---
         editor = QTextEdit()
         editor.setPlainText(text)
-        # Apply dark styling.
         editor.setStyleSheet("background-color: #313335; color: #ffffff;")
         
-        # Add new tab.
-        filename = os.path.basename(file_path)
-        self.tabWidget.addTab(editor, filename)
+        # Add syntax highlighting for Python files.
+        if file_path.endswith(".py"):
+            editor.highlighter = PythonHighlighter(editor.document())
+
+        # Save the original text for unsaved changes tracking.
+        editor.originalText = text
+        editor.textChanged.connect(lambda: self.updateTabTitle(editor, file_path))
+
+        index = self.tabWidget.addTab(editor, filename)
         self.tabWidget.setCurrentWidget(editor)
-        
-        # Map the file path to the editor widget.
         self.openFiles[file_path] = editor
+
+
+
 
     def openFile(self):
         options = QFileDialog.Options()
@@ -286,24 +402,32 @@ class CodeEditor(QMainWindow):
         if file_path:
             self.openFileInTab(file_path)
 
+    def updateTabTitle(self, editor, file_path):
+        index = self.tabWidget.indexOf(editor)
+        filename = os.path.basename(file_path)
+        currentText = editor.toPlainText()
+        # If the text differs from the original, mark as unsaved.
+        if currentText != editor.originalText:
+            # Add a white dot (●) to indicate unsaved changes.
+            title = f"{filename} ●"
+        else:
+            title = filename
+        self.tabWidget.setTabText(index, title)
+
     def handleSave(self):
-        """
-        Saves the current tab's file. If associated with a path, saves directly;
-        otherwise, prompts with a Save As dialog.
-        """
         currentEditor = self.tabWidget.currentWidget()
         if not currentEditor:
             return
-        
-        # Determine file path for the current editor.
         file_path = None
         for path, editor in self.openFiles.items():
             if editor == currentEditor:
                 file_path = path
                 break
-        
         if file_path:
             self.saveToFile(file_path, currentEditor)
+            # After saving, update the original text and remove the unsaved marker.
+            currentEditor.originalText = currentEditor.toPlainText()
+            self.updateTabTitle(currentEditor, file_path)
         else:
             self.saveFileAs(currentEditor)
 
